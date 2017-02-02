@@ -22,14 +22,14 @@ from requests.packages.urllib3 import disable_warnings
 #
 #          Amazon Account Access
 
-version = '1.3.0'
+version = '1.5.0'
 
 # CLI parser
 parser = argparse.ArgumentParser(description='AnWbiS: AWS Account Access')
 parser.add_argument('--version', action='version', version='%(prog)s'+version)
 parser.add_argument('--project', '-p', required=False, action = 'store', help = 'MANDATORY (if you are not using --iam_master_group, --iam_policy and --iam_delegated_role): Project to connect', default=False)
 parser.add_argument('--env', '-e', required=False, action = 'store', help = 'MANDATORY (if you are not using --iam_master_group, --iam_policy and --iam_delegated_role): Set environment', default=False,
-        choices=['dev', 'pre', 'prepro', 'pro', 'sbx', 'val', 'corp', 'qa', 'staging', 'demo'])
+        choices=['dev', 'pre', 'prepro', 'pro', 'sbx', 'val', 'corp', 'qa', 'staging', 'demo', 'piloto'])
 parser.add_argument('--role', '-r', required=False, action = 'store', help = 'Set role to use', default=False,
         choices=['developer', 'devops', 'user', 'admin', 'audit', 'contractor, cd'])
 parser.add_argument('--contractor', '-c', required=False, action = 'store', help = 'Set role to use with contractor policies', default=False)
@@ -47,6 +47,8 @@ parser.add_argument('--duration', type=int, required=False, action = 'store', he
 parser.add_argument('--iam_master_group', required=False, action = 'store', help = 'MANDATORY (if you are not using -p -e and -r flags): Master account group name to use', default=False)
 parser.add_argument('--iam_policy', required=False, action = 'store', help = 'MANDATORY (if you are not using -p -e and -r flags): IAM Policy to use', default=False)
 parser.add_argument('--iam_delegated_role', required=False, action = 'store', help = 'MANDATORY (if you are not using -p -e and -r flags): IAM delegated role to use', default=False)
+parser.add_argument('--from_ec2_role', required=False, action='store_true', help='Optional: use IAM role credentials stored in EC2 instead of users (advice: combine it with externalid)', default=False)
+parser.add_argument('--get_session', required=False, action='store_true', help='Optional: use STS get_session_token)', default=False)
 parser.add_argument('--stdout', required=False, action='store_true', help='Optional: get export commands to set environment variables', default=False)
 parser.add_argument('--teleport', '-t', required=False, action = 'store', help = 'Teleport to instance', default=False)
 parser.add_argument('--filter', '-f', required=False, action = 'store', help = 'Filter instance name', default=False)
@@ -273,13 +275,95 @@ def get_sts_token(sts_connection, role_arn, mfa_serial_number, role_session_name
 
     return { 'access_key':access_key, 'session_key': session_key, 'session_token': session_token, 'role_session_name': role_session_name }
 
+def get_session_token(sts_connection, role_arn, mfa_serial_number, role_session_name, project_name, environment_name, role_name, token_expiration, session_token_expiration):
+    try:
+
+        if not args.nomfa:
+            mfa_token = raw_input("Enter the MFA code: ")
+            sts_session = sts_connection.get_session_token(
+                duration=session_token_expiration,
+                mfa_serial_number=mfa_serial_number,
+                mfa_token=mfa_token
+            )
+
+            session_sts_connection = STSConnection(aws_access_key_id=sts_session.access_key,
+                                                   aws_secret_access_key=sts_session.secret_key,
+                                                   security_token=sts_session.session_token)
+
+            if args.externalid:
+                assumed_role_object = session_sts_connection.assume_role(
+                    role_arn=role_arn,
+
+                    role_session_name=role_session_name,
+                    duration_seconds=token_expiration,
+                    external_id=externalid
+                )
+            else:
+                assumed_role_object = session_sts_connection.assume_role(
+                    role_arn=role_arn,
+                    role_session_name=role_session_name,
+                    duration_seconds=token_expiration,
+                )
+        else:
+             colormsg ("When using get_session you must use MFA", "error")
+             exit(1)
+
+    except Exception, e:
+        colormsg ("There was an error assuming role", "error")
+        verbose(e)
+        exit(1)
+
+    colormsg ("Assumed the role successfully", "ok")
+
+    # Format resulting temporary credentials into a JSON block using
+    # known field names.
+    access_key = sts_session.access_key
+    session_key = sts_session.secret_key
+    session_token = sts_session.session_token
+    expiration = sts_session.expiration
+
+    login_to_fedaccount(access_key, session_key, session_token, role_session_name)
+
+    if not args.profile:
+        credential_profile='default'
+    else:
+        credential_profile=args.profile
+
+    save_credentials(access_key, session_key, session_token, role_session_name, 'corp', 'session', credential_profile, region)
+
+    #save_credentials(access_key, session_key, session_token, role_session_name, project_name, environment_name, role_name, region)
+
+    #and save them on the CLI config file .aws/credentials
+
+    save_cli_credentials(access_key, session_key, session_token, '-'.join(['corp','session',credential_profile]), region)
+
+    if args.stdout:
+        print ""
+        print "If you want to use your credentials from the environment with an external Tool (for instance, Terraform), you can use the following instructions:"
+        print "WARNING: If you use it in the same shell as anwbis exported variables takes precedence over the .aws/credentials, so use it carefully"
+        print ""
+        print "export AWS_ACCESS_KEY_ID='%s'" % access_key
+        print "export AWS_SECRET_ACCESS_KEY='%s'" % session_key
+        print "export AWS_SESSION_TOKEN='%s'" % session_token
+        print "export AWS_DEFAULT_REGION='%s'" % region
+        print "Expiration='%s'" % expiration
+        print ""
+
+    return { 'access_key':access_key, 'session_key': session_key, 'session_token': session_token, 'role_session_name': role_session_name }
+
 def save_cli_credentials(access_key, session_key, session_token, section_name, region):
 
     import ConfigParser
     import os
 
     config = ConfigParser.RawConfigParser()
-
+    home = os.path.expanduser("~")
+    basedir = os.path.dirname(home+'/.aws/credentials')
+    if not os.path.exists(basedir):
+        os.makedirs(basedir)
+    if not os.path.isfile(home+'/.aws/credentials'):
+        verbose("There is no ~/.aws/credentials (probably using an EC2 instance profile. Creating credentials file...")
+        open(home+'/.aws/credentials', 'a').close() 
     config.read(os.path.expanduser('~/.aws/credentials'))
 
     if not config.has_section(section_name):
@@ -360,24 +444,24 @@ def login_to_fedaccount(access_key, session_key, session_token, role_session_nam
     # generated URL.
     chrome_path = '/usr/bin/google-chrome %s'
     firefox_path = '/usr/bin/firefox %s'
-    chromium_path = '/usr/bin/chromium %s'
+    chromium_path = '/usr/bin/chromium-browser %s'
     if browser == 'firefox':
         try:
-            webbrowser.get(firefox_path).open(request_url)
+            webbrowser.get(firefox_path).open(request_url,new=0)
         except Exception, e:
             colormsg ("There was an error while open your browser", "error")
             verbose(e)
             exit(1)
     elif browser == 'chrome':
         try:
-            webbrowser.get(chrome_path).open(request_url)
+            webbrowser.get(chrome_path).open(request_url,new=0)
         except Exception, e:
             colormsg ("There was an error while open your browser", "error")
             verbose(e)
             exit(1)
     elif browser == 'chromium':
         try:
-            webbrowser.get(chromium_path).open(request_url)
+            webbrowser.get(chromium_path).open(request_url,new=0)
         except Exception, e:
             colormsg ("There was an error while open your browser", "error")
             verbose(e)
@@ -433,16 +517,18 @@ class Anwbis:
         # Set values from parser
 
         if not args.project or not args.env:
-            if not args.iam_master_group or not args.iam_policy or not args.iam_delegated_role:
+            if not args.iam_master_group or not args.iam_policy or not args.iam_delegated_role and not args.from_ec2_role:
                 colormsg("You must provide either -p and -e flags or --iam_master_group, --iam_policy and --iam_delegated_role to use Anwbis", "error")
                 exit(1)
-
+            elif args.from_ec2_role and not args.iam_delegated_role:
+                colormsg("When using credentials stored in EC2 roles you must use either -p and -e flags or --iam_delegated_role to use Anwbis", "error")
+                exit(1)
         if args.role:
             if args.role == 'contractor' and not args.contractor:
                 colormsg ("When using role contractor you must provide --contractor (-c) flag with the contractor policy to asume", "error")
                 exit(1)
             elif args.role == 'contractor' and args.contractor and not args.externalid:
-                colormsg ("When using role contractor you must provide --externalid (-e) code with the ExternalID to use", "error")
+                colormsg ("When using role contractor you must provide --externalid (-ext) code with the ExternalID to use", "error")
                 exit(1)
             elif args.role == 'contractor' and args.contractor and args.externalid:
                 role = args.role+'-'+args.contractor
@@ -477,13 +563,24 @@ class Anwbis:
         else:
             browser = 'none'
 
+        # Max token duration = 1h, session token = 8h
 
         if args.duration > 3600:
             token_expiration=3600
+            if args.get_session:
+                if args.duration > 28800:
+                    session_token_expiration = 28800
         elif args.duration < 900:
             token_expiration=900
+            if args.get_session:
+                session_token_expiration=token_expiration
         else:
             token_expiration=args.duration
+            if args.get_session and not args.duration:
+                session_token_expiration=token_expiration
+            else:
+                session_token_expiration=28800
+
 
         if args.externalid:
             externalid = args.externalid
@@ -498,7 +595,15 @@ class Anwbis:
 
         #role_session_name=iam_connection.get_user()['get_user_response']['get_user_result']['user']['user_name']
         try:
-            role_session_name=iam_connection.get_user().get_user_response.get_user_result.user.user_name
+            if args.from_ec2_role:
+                request_url = "http://169.254.169.254/latest/meta-data/iam/info/"
+                r = requests.get(request_url)
+                profilearn=json.loads(r.text)["InstanceProfileArn"]
+                profileid=json.loads(r.text)["InstanceProfileId"]
+                profilename=json.loads(r.text)["InstanceProfileArn"].split('/')[1]
+                role_session_name=profilename
+            else:
+                role_session_name=iam_connection.get_user().get_user_response.get_user_result.user.user_name
         except Exception, e:
             colormsg ("There was an error retrieving your session_name. Check your credentials", "error")
             verbose(e)
@@ -506,7 +611,12 @@ class Anwbis:
 
         #account_id=iam_connection.get_user()['get_user_response']['get_user_result']['user']['arn'].split(':')[4]
         try:
-            account_id=iam_connection.get_user().get_user_response.get_user_result.user.arn.split(':')[4]
+            if args.from_ec2_role:
+                account_id=profilearn=json.loads(r.text)["InstanceProfileArn"].split(':')[4]
+                account_id_from_user=account_id
+                role_name_from_user=profilename
+            else:
+                account_id=iam_connection.get_user().get_user_response.get_user_result.user.arn.split(':')[4]
         except Exception, e:
             colormsg ("There was an error retrieving your account id. Check your credentials", "error")
             verbose(e)
@@ -515,11 +625,22 @@ class Anwbis:
         # Regexp for groups and policies. Set the policy name used by your organization
 
         if args.project and args.env:
-            group_name='corp-'+project+'-master-'+role
-            policy_name='Delegated_Roles'
-            role_filter=env+'-'+project+'-delegated-'+role
+            if not args.from_ec2_role:
+                group_name='corp-'+project+'-master-'+role
+                policy_name='Delegated_Roles'
+                role_filter=env+'-'+project+'-delegated-'+role
+            else:
+                group_name='IAM EC2 ROLE'
+                policy_name='Delegated_Roles'
+                role_filter=env+'-'+project+'-delegated-'+role
 
         # Get rid of the standard for using another policies or group names
+        elif args.from_ec2_role and args.iam_delegated_role:
+            role_filter=args.iam_delegated_role
+            # Fix references to project, env and role in .anwbis file for non-standard use
+            role=role_filter
+            project=group_name
+            env="ec2-role"
         elif args.iam_master_group and args.iam_policy and args.iam_delegated_role:
             group_name=args.iam_master_group
             policy_name=args.iam_policy
@@ -539,14 +660,25 @@ class Anwbis:
         delegated_arn = []
 
         try:
-            policy = iam_connection.get_group_policy( group_name, policy_name)
+            if not args.from_ec2_role:
+                policy = iam_connection.get_group_policy( group_name, policy_name)
+            else:
+                #policy = iam_connection.get_instance_profile(profilename)
+                policy = iam_connection.get_role_policy (profilename,policy_name)
         except Exception, e:
             colormsg ("There was an error retrieving your group policy. Check your credentials, group_name and policy_name", "error")
             verbose(e)
             exit(1)
-        policy = policy.get_group_policy_response.get_group_policy_result.policy_document
-        policy = urllib.unquote(policy)
-        group_policy.append(config_line_policy("iam:grouppolicy", group_name, policy_name, policy))
+
+        if not args.from_ec2_role:
+            policy = policy.get_group_policy_response.get_group_policy_result.policy_document
+            policy = urllib.unquote(policy)
+            group_policy.append(config_line_policy("iam:grouppolicy", group_name, policy_name, policy))
+
+        else:
+            policy = policy.get_role_policy_response.get_role_policy_result.policy_document
+            policy = urllib.unquote(policy)
+            group_policy.append(config_line_policy("iam:grouppolicy", group_name, policy_name, policy))
 
         output_lines(group_policy)
 
@@ -574,6 +706,7 @@ class Anwbis:
         else:
             colormsg("There are two or more policies matching your input", "error")
             exit(1)
+
 
         colormsg("You are authenticated as " + role_session_name, "ok")
 
@@ -611,36 +744,36 @@ class Anwbis:
                 colormsg("Assuming role "+ role+ " from project "+ project+ " from user "+ role_session_name+ "...", "normal")
             elif args.iam_delegated_role:
                 colormsg("Assuming role "+ role+ " from user "+ role_session_name+ "...", "normal")
+        if args.get_session:
+                sts_token = get_session_token(sts_connection, role_arn, mfa_serial_number, role_session_name, project, env, role, token_expiration, session_token_expiration)
+        else:
+            if os.path.isfile(os.path.expanduser('~/.anwbis')):
 
+                with open(os.path.expanduser('~/.anwbis')) as json_file:
+                    root_json_data = json.load(json_file)
+                    json_file.close()
 
-        if os.path.isfile(os.path.expanduser('~/.anwbis')):
-            with open(os.path.expanduser('~/.anwbis')) as json_file:
-                root_json_data = json.load(json_file)
-                json_file.close()
+                    if project in root_json_data and env in root_json_data[project] and role in root_json_data[project][env]:
+                        json_data = root_json_data[project][env][role]
+                        anwbis_last_timestamp = json_data["anwbis_last_timestamp"]
 
-                if project in root_json_data and env in root_json_data[project] and role in root_json_data[project][env]:
-                    json_data = root_json_data[project][env][role]
-                    anwbis_last_timestamp = json_data["anwbis_last_timestamp"]
+                        #check if the token has expired
+                        if int(time.time()) - int(anwbis_last_timestamp) > token_expiration or args.refresh:
 
-                    #check if the token has expired
-                    if int(time.time()) - int(anwbis_last_timestamp) > token_expiration or args.refresh:
+                            verbose("token has expired")
+                            sts_token = get_sts_token(sts_connection, role_arn, mfa_serial_number, role_session_name, project, env, role, token_expiration)
 
-                        #print "token has expired"
-                        sts_token = get_sts_token(sts_connection, role_arn, mfa_serial_number, role_session_name, project, env, role, token_expiration)
-
-                    else:
-                        #print "token has not expired, trying to login..."
+                        else:
+                            verbose("token has not expired, trying to login...")
                         login_to_fedaccount(json_data["access_key"], json_data["session_key"], json_data["session_token"], json_data["role_session_name"])
                         sts_token = {'access_key':json_data["access_key"], 'session_key':json_data["session_key"], 'session_token': json_data["session_token"], 'role_session_name': json_data["role_session_name"]}
 
-                else:
-                    sts_token = get_sts_token(sts_connection, role_arn, mfa_serial_number, role_session_name, project, env, role, token_expiration)
-
-        else:
-            #print ".anwbis configuration file doesnt exists"
-            verbose("role is " +  role)
-            sts_token = get_sts_token(sts_connection, role_arn, mfa_serial_number, role_session_name, project, env, role, token_expiration)
-
+                    else:
+                        sts_token = get_sts_token(sts_connection, role_arn, mfa_serial_number, role_session_name, project, env, role, token_expiration)
+            else:
+                #print ".anwbis configuration file doesnt exists"
+                verbose("role is " +  role)
+                sts_token = get_sts_token(sts_connection, role_arn, mfa_serial_number, role_session_name, project, env, role, token_expiration)
         return sts_token
 
     def controller(self):
