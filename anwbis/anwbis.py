@@ -31,7 +31,7 @@ parser.add_argument('--project', '-p', required=False, action = 'store', help = 
 parser.add_argument('--env', '-e', required=False, action = 'store', help = 'MANDATORY (if you are not using --iam_master_group, --iam_policy and --iam_delegated_role): Set environment', default=False,
         choices=['dev', 'pre', 'prepro', 'pro', 'sbx', 'val', 'corp', 'qa', 'staging', 'demo', 'piloto', 'cd'])
 parser.add_argument('--role', '-r', required=False, action = 'store', help = 'Set role to use', default=False,
-        choices=['developer', 'devops', 'user', 'admin', 'audit', 'contractor'])
+        choices=['developer', 'devops', 'user', 'admin', 'audit', 'contractor', 'cd'])
 parser.add_argument('--contractor', '-c', required=False, action = 'store', help = 'Set role to use with contractor policies', default=False)
 parser.add_argument('--externalid', '-ext', required=False, action = 'store', help = 'Set External-ID to use with contractor policies', default=False)
 parser.add_argument('--region', required=False, action = 'store', help = 'Set region for EC2', default=False,
